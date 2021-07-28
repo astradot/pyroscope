@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	golog "log"
 	"net/http"
@@ -11,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt"
 	"github.com/markbates/pkger"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
@@ -38,6 +39,7 @@ type Controller struct {
 
 	config     *config.Server
 	storage    *storage.Storage
+	ingester   storage.Ingester
 	log        *logrus.Logger
 	httpServer *http.Server
 
@@ -49,7 +51,7 @@ type Controller struct {
 	appStats *hyperloglog.HyperLogLogPlus
 }
 
-func New(c *config.Server, s *storage.Storage, l *logrus.Logger) (*Controller, error) {
+func New(c *config.Server, s *storage.Storage, i storage.Ingester, l *logrus.Logger) (*Controller, error) {
 	appStats, err := hyperloglog.NewPlus(uint8(18))
 	if err != nil {
 		return nil, err
@@ -59,6 +61,7 @@ func New(c *config.Server, s *storage.Storage, l *logrus.Logger) (*Controller, e
 		config:   c,
 		log:      l,
 		storage:  s,
+		ingester: i,
 		stats:    make(map[string]int),
 		appStats: appStats,
 	}
@@ -78,46 +81,51 @@ func (ctrl *Controller) assetsFilesHandler(w http.ResponseWriter, r *http.Reques
 	fs.ServeHTTP(w, r)
 }
 
-func (ctrl *Controller) mux() http.Handler {
+func (ctrl *Controller) mux() (http.Handler, error) {
 	mux := http.NewServeMux()
-	addRoutes(mux, []route{
-		{"/healthz", ctrl.healthz},
-		{"/metrics", promhttp.Handler().ServeHTTP},
-		{"/config", ctrl.configHandler},
-		{"/build", ctrl.buildHandler},
-	})
 
-	// auth routes
-	addRoutes(mux, ctrl.getAuthRoutes(), ctrl.drainMiddleware)
+	// Routes not protected with auth. Drained at shutdown.
+	insecureRoutes, err := ctrl.getAuthRoutes()
+	if err != nil {
+		return nil, err
+	}
+	insecureRoutes = append(insecureRoutes, []route{
+		{"/ingest", ctrl.ingestHandler},
+		{"/forbidden", ctrl.forbiddenHandler()},
+		{"/assets/", ctrl.assetsFilesHandler},
+	}...)
+	addRoutes(mux, insecureRoutes, ctrl.drainMiddleware)
 
-	// drainable routes:
-	routes := []route{
+	// Protected routes:
+	protectedRoutes := []route{
 		{"/", ctrl.indexHandler()},
 		{"/render", ctrl.renderHandler},
 		{"/labels", ctrl.labelsHandler},
 		{"/label-values", ctrl.labelValuesHandler},
 	}
+	addRoutes(mux, protectedRoutes, ctrl.drainMiddleware, ctrl.authMiddleware)
 
-	addRoutes(mux, routes, ctrl.drainMiddleware, ctrl.authMiddleware)
-
+	// Diagnostic secure routes: must be protected but not drained.
+	diagnosticSecureRoutes := []route{
+		{"/config", ctrl.configHandler},
+		{"/build", ctrl.buildHandler},
+	}
 	if !ctrl.config.DisablePprofEndpoint {
-		addRoutes(mux, []route{
+		diagnosticSecureRoutes = append(diagnosticSecureRoutes, []route{
 			{"/debug/pprof/", pprof.Index},
 			{"/debug/pprof/cmdline", pprof.Cmdline},
 			{"/debug/pprof/profile", pprof.Profile},
 			{"/debug/pprof/symbol", pprof.Symbol},
 			{"/debug/pprof/trace", pprof.Trace},
-		})
+		}...)
 	}
+	addRoutes(mux, diagnosticSecureRoutes, ctrl.authMiddleware)
+	addRoutes(mux, []route{
+		{"/metrics", promhttp.Handler().ServeHTTP},
+		{"/healthz", ctrl.healthz},
+	})
 
-	nonAuthRoutes := []route{
-		{"/ingest", ctrl.ingestHandler},
-		{"/forbidden", ctrl.forbiddenHandler()},
-		{"/assets/", ctrl.assetsFilesHandler},
-	}
-
-	addRoutes(mux, nonAuthRoutes, ctrl.drainMiddleware)
-	return mux
+	return mux, nil
 }
 
 type oauthInfo struct {
@@ -180,7 +188,7 @@ func (ctrl *Controller) generateOauthInfo(oauthType int) *oauthInfo {
 	return nil
 }
 
-func (ctrl *Controller) getAuthRoutes() []route {
+func (ctrl *Controller) getAuthRoutes() ([]route, error) {
 	authRoutes := []route{
 		{"/login", ctrl.loginHandler()},
 		{"/logout", ctrl.logoutHandler()},
@@ -189,11 +197,11 @@ func (ctrl *Controller) getAuthRoutes() []route {
 	if ctrl.config.GoogleEnabled {
 		authURL, err := url.Parse(ctrl.config.GoogleAuthURL)
 		if err != nil {
-			ctrl.log.WithError(err).Error("Problem parsing google auth url")
+			return nil, err
 		}
 
 		googleOauthInfo := ctrl.generateOauthInfo(oauthGoogle)
-		if err == nil && googleOauthInfo != nil {
+		if googleOauthInfo != nil {
 			googleOauthInfo.AuthURL = authURL
 			authRoutes = append(authRoutes, []route{
 				{"/auth/google/login", ctrl.oauthLoginHandler(googleOauthInfo)},
@@ -207,12 +215,11 @@ func (ctrl *Controller) getAuthRoutes() []route {
 	if ctrl.config.GithubEnabled {
 		authURL, err := url.Parse(ctrl.config.GithubAuthURL)
 		if err != nil {
-			ctrl.log.WithError(err).Error("Problem parsing github auth url")
-			return nil
+			return nil, err
 		}
 
 		githubOauthInfo := ctrl.generateOauthInfo(oauthGithub)
-		if err == nil && githubOauthInfo != nil {
+		if githubOauthInfo != nil {
 			githubOauthInfo.AuthURL = authURL
 			authRoutes = append(authRoutes, []route{
 				{"/auth/github/login", ctrl.oauthLoginHandler(githubOauthInfo)},
@@ -225,12 +232,11 @@ func (ctrl *Controller) getAuthRoutes() []route {
 	if ctrl.config.GitlabEnabled {
 		authURL, err := url.Parse(ctrl.config.GitlabAuthURL)
 		if err != nil {
-			ctrl.log.WithError(err).Error("Problem parsing gitlab auth url")
-			return nil
+			return nil, err
 		}
 
 		gitlabOauthInfo := ctrl.generateOauthInfo(oauthGitlab)
-		if err == nil && gitlabOauthInfo != nil {
+		if gitlabOauthInfo != nil {
 			gitlabOauthInfo.AuthURL = authURL
 			authRoutes = append(authRoutes, []route{
 				{"/auth/gitlab/login", ctrl.oauthLoginHandler(gitlabOauthInfo)},
@@ -240,7 +246,7 @@ func (ctrl *Controller) getAuthRoutes() []route {
 		}
 	}
 
-	return authRoutes
+	return authRoutes, nil
 }
 
 func (ctrl *Controller) Start() error {
@@ -248,9 +254,14 @@ func (ctrl *Controller) Start() error {
 	w := logger.Writer()
 	defer w.Close()
 
+	handler, err := ctrl.mux()
+	if err != nil {
+		return err
+	}
+
 	ctrl.httpServer = &http.Server{
 		Addr:           ctrl.config.APIBindAddr,
-		Handler:        ctrl.mux(),
+		Handler:        handler,
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,
 		IdleTimeout:    30 * time.Second,
@@ -260,11 +271,11 @@ func (ctrl *Controller) Start() error {
 
 	// ListenAndServe always returns a non-nil error. After Shutdown or Close,
 	// the returned error is ErrServerClosed.
-	err := ctrl.httpServer.ListenAndServe()
-	if err == http.ErrServerClosed {
+	err = ctrl.httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
-	return fmt.Errorf("listen and serve: %v", err)
+	return err
 }
 
 func (ctrl *Controller) Stop() error {
@@ -316,11 +327,39 @@ func (ctrl *Controller) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		})
 
 		if err != nil {
-			ctrl.log.WithError(err).Error("parsing jwt token")
+			ctrl.log.WithError(err).Error("invalid jwt token")
 			http.Redirect(w, r, "/login", http.StatusTemporaryRedirect)
 			return
 		}
 
 		next.ServeHTTP(w, r)
 	}
+}
+
+func (ctrl *Controller) writeInvalidParameterError(w http.ResponseWriter, err error) {
+	ctrl.writeError(w, http.StatusBadRequest, err, "invalid parameter")
+}
+
+func (ctrl *Controller) writeInternalServerError(w http.ResponseWriter, err error, msg string) {
+	ctrl.writeError(w, http.StatusInternalServerError, err, msg)
+}
+
+func (ctrl *Controller) writeJSONEncodeError(w http.ResponseWriter, err error) {
+	ctrl.writeInternalServerError(w, err, "encoding response body")
+}
+
+func (ctrl *Controller) writeError(w http.ResponseWriter, code int, err error, msg string) {
+	logrus.WithError(err).Error(msg)
+	writeMessage(w, code, "%s: %q", msg, err)
+}
+
+func (ctrl *Controller) writeErrorMessage(w http.ResponseWriter, code int, msg string) {
+	logrus.Error(msg)
+	writeMessage(w, code, msg)
+}
+
+func writeMessage(w http.ResponseWriter, code int, format string, args ...interface{}) {
+	w.WriteHeader(code)
+	_, _ = fmt.Fprintf(w, format, args...)
+	_, _ = fmt.Fprintln(w)
 }

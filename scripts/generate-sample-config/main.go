@@ -100,7 +100,12 @@ func writeConfigDocs(w io.Writer, subcommand, format string) {
 		}
 	case "server":
 		val = new(config.Server)
-		cli.PopulateFlagSet(val, flagSet, opts...)
+		// Skip `metric-export-rules` only from CLI reference.
+		if format == "md" {
+			cli.PopulateFlagSet(val, flagSet, append(opts, cli.WithSkip("metric-export-rules"))...)
+		} else {
+			cli.PopulateFlagSet(val, flagSet, opts...)
+		}
 	case "convert":
 		val = new(config.Convert)
 		cli.PopulateFlagSet(val, flagSet, opts...)
@@ -112,6 +117,9 @@ func writeConfigDocs(w io.Writer, subcommand, format string) {
 		cli.PopulateFlagSet(val, flagSet, append(opts, cli.WithSkip("group-name", "user-name", "no-root-drop"))...)
 	case "target":
 		val = new(config.Target)
+		cli.PopulateFlagSet(val, flagSet, append(opts, cli.WithSkip("tags"))...)
+	case "metric-export-rule":
+		val = new(config.MetricExportRule)
 		cli.PopulateFlagSet(val, flagSet, opts...)
 	default:
 		log.Fatalf("Unknown subcommand %q", subcommand)
@@ -139,9 +147,10 @@ func writeYaml(w io.Writer, sf *cli.SortedFlags) {
 			return
 		}
 		var v string
-		if reflect.TypeOf(f.Value).Elem().Kind() == reflect.Slice {
+		switch reflect.TypeOf(f.Value).Elem().Kind() {
+		case reflect.Slice, reflect.Map:
 			v = f.Value.String()
-		} else {
+		default:
 			v = fmt.Sprintf("%q", f.Value)
 		}
 		_, _ = fmt.Fprintf(w, "# %s\n%s: %s\n\n", toPrettySentence(f.Usage), f.Name, v)

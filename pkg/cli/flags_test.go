@@ -118,6 +118,83 @@ var _ = Describe("flags", func() {
 				Expect(cfg.Foo).To(Equal("test-val-4"))
 			})
 
+			It("server configuration", func() {
+				exampleFlagSet := flag.NewFlagSet("example flag set", flag.ExitOnError)
+				var cfg config.Server
+				PopulateFlagSet(&cfg, exampleFlagSet)
+
+				exampleCommand := &ffcli.Command{
+					FlagSet: exampleFlagSet,
+					Options: []ff.Option{
+						ff.WithIgnoreUndefined(true),
+						ff.WithConfigFileParser(parser),
+						ff.WithConfigFileFlag("config"),
+					},
+					Exec: func(_ context.Context, args []string) error {
+						return nil
+					},
+				}
+
+				err := exampleCommand.ParseAndRun(context.Background(), []string{
+					"-config", "testdata/server.yml",
+				})
+
+				Expect(err).ToNot(HaveOccurred())
+				Expect(cfg).To(Equal(config.Server{
+					AnalyticsOptOut:          false,
+					Config:                   "testdata/server.yml",
+					LogLevel:                 "info",
+					BadgerLogLevel:           "error",
+					StoragePath:              "/var/lib/pyroscope",
+					APIBindAddr:              ":4040",
+					BaseURL:                  "",
+					CacheEvictThreshold:      0.25,
+					CacheEvictVolume:         0.33,
+					BadgerNoTruncate:         false,
+					DisablePprofEndpoint:     false,
+					MaxNodesSerialization:    2048,
+					MaxNodesRender:           8192,
+					HideApplications:         nil,
+					Retention:                0,
+					SampleRate:               0,
+					OutOfSpaceThreshold:      0,
+					CacheDimensionSize:       0,
+					CacheDictionarySize:      0,
+					CacheSegmentSize:         0,
+					CacheTreeSize:            0,
+					GoogleEnabled:            false,
+					GoogleClientID:           "",
+					GoogleClientSecret:       "",
+					GoogleRedirectURL:        "",
+					GoogleAuthURL:            "https://accounts.google.com/o/oauth2/auth",
+					GoogleTokenURL:           "https://accounts.google.com/o/oauth2/token",
+					GitlabEnabled:            false,
+					GitlabApplicationID:      "",
+					GitlabClientSecret:       "",
+					GitlabRedirectURL:        "",
+					GitlabAuthURL:            "https://gitlab.com/oauth/authorize",
+					GitlabTokenURL:           "https://gitlab.com/oauth/token",
+					GitlabAPIURL:             "https://gitlab.com/api/v4/user",
+					GithubEnabled:            false,
+					GithubClientID:           "",
+					GithubClientSecret:       "",
+					GithubRedirectURL:        "",
+					GithubAuthURL:            "https://github.com/login/oauth/authorize",
+					GithubTokenURL:           "https://github.com/login/oauth/access_token",
+					JWTSecret:                "",
+					LoginMaximumLifetimeDays: 0,
+					MetricExportRules:        nil,
+				}))
+
+				Expect(loadServerConfig(&cfg)).ToNot(HaveOccurred())
+				Expect(cfg.MetricExportRules).To(Equal(config.MetricExportRules{
+					"my_metric_name": {
+						Expr: `app.name{foo=~"bar"}`,
+						Node: "a;b;c",
+					},
+				}))
+			})
+
 			It("agent configuration", func() {
 				exampleFlagSet := flag.NewFlagSet("example flag set", flag.ExitOnError)
 				var cfg config.Agent
@@ -137,6 +214,7 @@ var _ = Describe("flags", func() {
 
 				err := exampleCommand.ParseAndRun(context.Background(), []string{
 					"-config", "testdata/agent.yml",
+					"-tag", "baz=zzz",
 				})
 
 				Expect(err).ToNot(HaveOccurred())
@@ -148,18 +226,76 @@ var _ = Describe("flags", func() {
 					AuthToken:              "",
 					UpstreamThreads:        4,
 					UpstreamRequestTimeout: 10 * time.Second,
+					Tags: map[string]string{
+						"baz": "zzz",
+					},
 				}))
 
-				Expect(loadTargets(&cfg)).ToNot(HaveOccurred())
-				Expect(cfg.Targets).To(Equal([]config.Target{
-					{
-						ServiceName:        "foo",
-						SpyName:            "debugspy",
-						ApplicationName:    "foo.app",
-						SampleRate:         0,
-						DetectSubprocesses: false,
-						PyspyBlocking:      false,
-						RbspyBlocking:      false,
+				Expect(loadAgentConfig(&cfg)).ToNot(HaveOccurred())
+				Expect(cfg).To(Equal(config.Agent{
+					Config:                 "testdata/agent.yml",
+					LogLevel:               "debug",
+					NoLogging:              false,
+					ServerAddress:          "http://localhost:4040",
+					AuthToken:              "",
+					UpstreamThreads:        4,
+					UpstreamRequestTimeout: 10 * time.Second,
+					Tags: map[string]string{
+						"foo": "bar",
+						"baz": "zzz",
+					},
+					Targets: []config.Target{
+						{
+							ServiceName:        "foo",
+							SpyName:            "debugspy",
+							ApplicationName:    "foo.app",
+							SampleRate:         0,
+							DetectSubprocesses: false,
+							PyspyBlocking:      false,
+							RbspyBlocking:      false,
+							Tags: map[string]string{
+								"foo": "bar",
+								"baz": "zzz",
+							},
+						},
+					},
+				}))
+			})
+
+			It("parses tag flags in exec", func() {
+				exampleFlagSet := flag.NewFlagSet("example flag set", flag.ExitOnError)
+				var cfg config.Exec
+				PopulateFlagSet(&cfg, exampleFlagSet)
+
+				exampleCommand := &ffcli.Command{
+					FlagSet: exampleFlagSet,
+					Options: []ff.Option{
+						ff.WithIgnoreUndefined(true),
+						ff.WithConfigFileParser(parser),
+						ff.WithConfigFileFlag("config"),
+					},
+					Exec: func(_ context.Context, args []string) error {
+						return nil
+					},
+				}
+
+				err := exampleCommand.ParseAndRun(context.Background(), []string{
+					"-tag", "foo=bar",
+					"-tag", "baz=qux",
+				})
+
+				Expect(err).ToNot(HaveOccurred())
+				Expect(cfg).To(Equal(config.Exec{
+					SpyName:                "auto",
+					SampleRate:             100,
+					DetectSubprocesses:     true,
+					LogLevel:               "info",
+					ServerAddress:          "http://localhost:4040",
+					UpstreamThreads:        4,
+					UpstreamRequestTimeout: 10 * time.Second,
+					Tags: map[string]string{
+						"foo": "bar",
+						"baz": "qux",
 					},
 				}))
 			})

@@ -24,6 +24,7 @@ var (
 
 type Config struct {
 	ApplicationName string // e.g backend.purchases
+	Tags            map[string]string
 	ServerAddress   string // e.g http://pyroscope.services.internal:4040
 	AuthToken       string // specify this token when using pyroscope cloud
 	SampleRate      uint32
@@ -62,7 +63,8 @@ func Start(cfg Config) (*Profiler, error) {
 	sc := agent.SessionConfig{
 		Upstream:         upstream,
 		AppName:          cfg.ApplicationName,
-		ProfilingTypes:   types.DefaultProfileTypes,
+		Tags:             cfg.Tags,
+		ProfilingTypes:   cfg.ProfileTypes,
 		DisableGCRuns:    cfg.DisableGCRuns,
 		SpyName:          types.GoSpy,
 		SampleRate:       cfg.SampleRate,
@@ -70,14 +72,15 @@ func Start(cfg Config) (*Profiler, error) {
 		Pid:              0,
 		WithSubprocesses: false,
 	}
-	session := agent.NewSession(&sc, cfg.Logger)
-	if err := session.Start(); err != nil {
-		return nil, fmt.Errorf("start session: %v", err)
+	session, err := agent.NewSession(&sc, cfg.Logger)
+	if err != nil {
+		return nil, fmt.Errorf("new session: %w", err)
+	}
+	if err = session.Start(); err != nil {
+		return nil, fmt.Errorf("start session: %w", err)
 	}
 
-	return &Profiler{
-		session: session,
-	}, nil
+	return &Profiler{session: session}, nil
 }
 
 // Stop stops continious profiling session

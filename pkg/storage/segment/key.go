@@ -1,14 +1,13 @@
-package storage
+package segment
 
 import (
-	"encoding/binary"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/pyroscope-io/pyroscope/pkg/flameql"
 	"github.com/pyroscope-io/pyroscope/pkg/structs/sortedmap"
-	"github.com/twmb/murmur3"
 )
 
 type Key struct {
@@ -28,26 +27,23 @@ const (
 	doneParserState
 )
 
-// TODO: should rewrite this at some point to not rely on regular expressions & splits
+func NewKey(labels map[string]string) *Key { return &Key{labels: labels} }
+
 func ParseKey(name string) (*Key, error) {
-	k := &Key{
-		labels: make(map[string]string),
-	}
-
-	p := parser{
-		parserState: nameParserState,
-		key:         "",
-		value:       "",
-	}
-
+	k := &Key{labels: make(map[string]string)}
+	p := parser{parserState: nameParserState}
+	var err error
 	for _, r := range name + "{" {
 		switch p.parserState {
 		case nameParserState:
-			p.nameParserCase(r, k)
+			err = p.nameParserCase(r, k)
 		case tagKeyParserState:
 			p.tagKeyParserCase(r)
 		case tagValueParserState:
-			p.tagValueParserCase(r, k)
+			err = p.tagValueParserCase(r, k)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 	return k, nil
@@ -60,14 +56,19 @@ type parser struct {
 }
 
 // ParseKey's nameParserState switch case
-func (p *parser) nameParserCase(r int32, k *Key) {
+func (p *parser) nameParserCase(r int32, k *Key) error {
 	switch r {
 	case '{':
 		p.parserState = tagKeyParserState
-		k.labels["__name__"] = strings.TrimSpace(p.value)
+		appName := strings.TrimSpace(p.value)
+		if err := flameql.ValidateAppName(appName); err != nil {
+			return err
+		}
+		k.labels["__name__"] = appName
 	default:
 		p.value += string(r)
 	}
+	return nil
 }
 
 // ParseKey's tagKeyParserState switch case
@@ -84,27 +85,38 @@ func (p *parser) tagKeyParserCase(r int32) {
 }
 
 // ParseKey's tagValueParserState switch case
-func (p *parser) tagValueParserCase(r int32, k *Key) {
+func (p *parser) tagValueParserCase(r int32, k *Key) error {
 	switch r {
 	case ',', '}':
 		p.parserState = tagKeyParserState
-		k.labels[strings.TrimSpace(p.key)] = strings.TrimSpace(p.value)
+		key := strings.TrimSpace(p.key)
+		if !flameql.IsTagKeyReserved(key) {
+			if err := flameql.ValidateTagKey(key); err != nil {
+				return err
+			}
+		}
+		k.labels[key] = strings.TrimSpace(p.value)
 		p.key = ""
 	default:
 		p.value += string(r)
 	}
+	return nil
 }
 
 func (k *Key) SegmentKey() string {
 	return k.Normalized()
 }
 
+func segmentKeyToTreeKey(k string, depth int, t time.Time) string {
+	return k + ":" + strconv.Itoa(depth) + ":" + strconv.Itoa(int(t.Unix()))
+}
+
 func (k *Key) TreeKey(depth int, t time.Time) string {
-	return k.Normalized() + ":" + strconv.Itoa(depth) + ":" + strconv.Itoa(int(t.Unix()))
+	return segmentKeyToTreeKey(k.Normalized(), depth, t)
 }
 
 func (k *Key) DictKey() string {
-	return k.Normalized()
+	return k.labels["__name__"]
 }
 
 // FromTreeToDictKey returns app name from tree key k: given tree key
@@ -149,15 +161,10 @@ func (k *Key) Normalized() string {
 	return sb.String()
 }
 
-func (k *Key) Hashed() []byte {
-	u1, u2 := murmur3.SeedSum128(seed, seed, []byte(k.Normalized()))
-
-	b := make([]byte, 16)
-	binary.LittleEndian.PutUint64(b[:8], u1)
-	binary.LittleEndian.PutUint64(b[8:16], u2)
-	return b
-}
-
 func (k *Key) AppName() string {
 	return k.labels["__name__"]
+}
+
+func (k *Key) Labels() map[string]string {
+	return k.labels
 }
